@@ -32,6 +32,8 @@ export interface OperationOptions {
   query?: string | DocumentNode;
   variables?: Object;
   operationName?: string;
+  // Optional operation id if the request was done in a different channel e.g. http call
+  opId?: string;
   [key: string]: any;
 }
 
@@ -66,6 +68,43 @@ export interface ClientOptions {
   connectionCallback?: (error: Error[], result?: any) => void;
   lazy?: boolean;
   inactivityTimeout?: number;
+}
+
+/**
+ * Expected message structure returned from the server
+ */
+interface ParsedMessage {
+  // Type as described in message-types.ts
+  type?: string;
+  id?: string;
+}
+
+interface OperationMessage extends ParsedMessage {
+  payload: {
+    errors?: any;
+    [key: string]: any;
+  };
+}
+
+function isOperationMessage(value: any): value is OperationMessage {
+  return typeof value.payload !== 'undefined';
+}
+
+interface Patch {
+  // Data provided in the @stream or @defer directive case
+  data: [{
+    [key: string]: any;
+  }];
+  // Path provided in the @stream or @defer directive case
+  path: [
+    string | number
+  ];
+}
+
+type PatchMessage = ParsedMessage & Patch;
+
+function isPatchMessage(value: any): value is PatchMessage {
+  return typeof value.data !== 'undefined' && typeof value.path !== 'undefined';
 }
 
 export class SubscriptionClient {
@@ -307,7 +346,7 @@ export class SubscriptionClient {
       this.connect();
     }
 
-    const opId = this.generateOperationId();
+    const opId = options.opId || this.generateOperationId();
     this.operations[opId] = { options: options, handler };
 
     this.applyMiddlewares(options)
@@ -577,78 +616,96 @@ export class SubscriptionClient {
   }
 
   private processReceivedData(receivedData: any) {
-    let parsedMessage: any;
-    let opId: string;
+    let parsedMessage: ParsedMessage;
 
     try {
       parsedMessage = JSON.parse(receivedData);
-      opId = parsedMessage.id;
     } catch (e) {
       throw new Error(`Message must be JSON-parseable. Got: ${receivedData}`);
     }
+
+    const opId = parsedMessage.id;
+    const payload = isOperationMessage(parsedMessage) ? parsedMessage.payload : undefined;
+    const patch: Patch | undefined = !payload ? (isPatchMessage(parsedMessage) ?
+      { data: parsedMessage.data, path: parsedMessage.path } : undefined
+    ) : undefined;
 
     if (
       [ MessageTypes.GQL_DATA,
         MessageTypes.GQL_COMPLETE,
         MessageTypes.GQL_ERROR,
-      ].indexOf(parsedMessage.type) !== -1 && !this.operations[opId]
+      ].indexOf(parsedMessage.type) !== -1 && opId && !this.operations[opId]
     ) {
       this.unsubscribe(opId);
+    } else {
+      switch (parsedMessage.type) {
+        case MessageTypes.GQL_CONNECTION_ERROR:
+          if (this.connectionCallback) {
+            this.connectionCallback(payload);
+          }
+          break;
 
-      return;
-    }
+        case MessageTypes.GQL_CONNECTION_ACK:
+          this.eventEmitter.emit(this.reconnecting ? 'reconnected' : 'connected');
+          this.reconnecting = false;
+          this.backoff.reset();
+          this.maxConnectTimeGenerator.reset();
 
-    switch (parsedMessage.type) {
-      case MessageTypes.GQL_CONNECTION_ERROR:
-        if (this.connectionCallback) {
-          this.connectionCallback(parsedMessage.payload);
-        }
-        break;
+          if (this.connectionCallback) {
+            this.connectionCallback();
+          }
+          break;
 
-      case MessageTypes.GQL_CONNECTION_ACK:
-        this.eventEmitter.emit(this.reconnecting ? 'reconnected' : 'connected');
-        this.reconnecting = false;
-        this.backoff.reset();
-        this.maxConnectTimeGenerator.reset();
+        case MessageTypes.GQL_COMPLETE:
+          if (opId) {
+            this.operations[opId].handler(null, null);
+            delete this.operations[opId];
+          }
+          break;
 
-        if (this.connectionCallback) {
-          this.connectionCallback();
-        }
-        break;
+        case MessageTypes.GQL_ERROR:
+          if (opId) {
+            this.operations[opId].handler(this.formatErrors(payload), null);
+            delete this.operations[opId];
+          }
+          break;
 
-      case MessageTypes.GQL_COMPLETE:
-        this.operations[opId].handler(null, null);
-        delete this.operations[opId];
-        break;
+        case MessageTypes.GQL_DATA:
+          if (opId && payload) {
+            const parsedPayload = !payload.errors ?
+              payload : {...payload, errors: this.formatErrors(payload.errors)};
+            this.operations[opId].handler(null, parsedPayload);
 
-      case MessageTypes.GQL_ERROR:
-        this.operations[opId].handler(this.formatErrors(parsedMessage.payload), null);
-        delete this.operations[opId];
-        break;
+            this.operations[opId].handler(this.formatErrors(payload), null);
+          } else if (opId && patch) {
+            this.operations[opId].handler(null, patch);
+          }
+          break;
 
-      case MessageTypes.GQL_DATA:
-        const parsedPayload = !parsedMessage.payload.errors ?
-          parsedMessage.payload : {...parsedMessage.payload, errors: this.formatErrors(parsedMessage.payload.errors)};
-        this.operations[opId].handler(null, parsedPayload);
-        break;
+        case MessageTypes.GQL_CONNECTION_KEEP_ALIVE:
+          const firstKA = typeof this.wasKeepAliveReceived === 'undefined';
+          this.wasKeepAliveReceived = true;
 
-      case MessageTypes.GQL_CONNECTION_KEEP_ALIVE:
-        const firstKA = typeof this.wasKeepAliveReceived === 'undefined';
-        this.wasKeepAliveReceived = true;
+          if (firstKA) {
+            this.checkConnection();
+          }
 
-        if (firstKA) {
-          this.checkConnection();
-        }
+          if (this.checkConnectionIntervalId) {
+            clearInterval(this.checkConnectionIntervalId);
+            this.checkConnection();
+          }
+          this.checkConnectionIntervalId = setInterval(this.checkConnection.bind(this), this.wsTimeout);
+          break;
 
-        if (this.checkConnectionIntervalId) {
-          clearInterval(this.checkConnectionIntervalId);
-          this.checkConnection();
-        }
-        this.checkConnectionIntervalId = setInterval(this.checkConnection.bind(this), this.wsTimeout);
-        break;
-
-      default:
-        throw new Error('Invalid message type!');
+        default:
+          if (patch) {
+            // TODO: remove when backend starts sending id in the response
+            this.operations[opId || 'bazinga'].handler(null, patch);
+            break;
+          } else {
+            throw new Error('Invalid message type!');
+          }
+      }
     }
   }
 
